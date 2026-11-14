@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -59,11 +60,30 @@ class NLPService:
         self.settings = get_settings()
         self._audit = AuditService(session)
 
-    async def _chat(self, system: str, user: str, *, model: str | None = None) -> str:
+    async def _chat(
+        self,
+        system: str,
+        user: str,
+        *,
+        chain: list[str] | None = None,
+        model: str | None = None,
+    ) -> str:
+        """
+        Try models in order: role chain (primary + 3 role fallbacks) then global.
+        `model` alone is treated as a 1-item chain (tests / overrides).
+        """
         from app.core.concurrency import nlp_slot
 
-        model = model or self.settings.nlp_parse_model
-        models = [model, self.settings.nlp_fallback_model]
+        if chain is None:
+            if model:
+                global_fb = (
+                    self.settings.nlp_global_fallback_model
+                    or self.settings.nlp_fallback_model
+                )
+                chain = self.settings.dedupe_models(model, global_fb)
+            else:
+                chain = self.settings.parse_model_chain()
+        models = chain
         last_err: Exception | None = None
         async with nlp_slot():
             for attempt, m in enumerate(models):
@@ -87,7 +107,16 @@ class NLPService:
                                 ],
                             },
                         )
-                        if resp.status_code == 429 and attempt == 0:
+                        if resp.status_code == 429:
+                            log_event(
+                                logger,
+                                "llm.rate_limited",
+                                level=logging.WARNING,
+                                model=m,
+                                attempt=attempt,
+                            )
+                            # Brief backoff before next model in the chain
+                            await asyncio.sleep(min(2.0 * (attempt + 1), 6.0))
                             continue
                         resp.raise_for_status()
                         data = resp.json()
@@ -99,17 +128,26 @@ class NLPService:
                                 level=logging.WARNING,
                                 model=m,
                                 primary=models[0],
+                                attempt=attempt,
+                                chain_len=len(models),
                             )
                         return content
                 except Exception as e:
                     last_err = e
-                    log_event(logger, "nlp.error", model=m, error=str(e))
+                    log_event(
+                        logger,
+                        "nlp.error",
+                        model=m,
+                        error=str(e),
+                        attempt=attempt,
+                    )
                     continue
         await self._audit.record(
             "llm.unavailable",
             level=logging.ERROR,
             source="nlp",
             error=str(last_err) if last_err else "unknown",
+            tried=models,
         )
         await self.session.commit()
         raise NLPParseError() from last_err
@@ -259,7 +297,7 @@ class NLPService:
             period_label=period_label,
         )
         content = await self._chat(
-            system, "generate insights", model=self.settings.nlp_report_model
+            system, "generate insights", chain=self.settings.report_model_chain()
         )
         data = _extract_json(content)
         if "_array" in data:

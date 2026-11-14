@@ -12,6 +12,7 @@ from telegram import Update
 
 from app.channels.telegram.formatters import format_split_preview
 from app.channels.telegram.keyboards import confirm_split_keyboard
+from app.channels.telegram.memory import remember_bot_reply
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import ValidationError
 from app.nlp.schemas import ParsedMessage
@@ -50,7 +51,9 @@ async def show_confirmation(
         await StateService(session).set_state(
             tg_id, "CONFIRM_SPLIT", user_id=user_id, pending_data=pending
         )
-    await msg.reply_text(format_split_preview(parsed), reply_markup=confirm_split_keyboard())
+    preview = format_split_preview(parsed)
+    await msg.reply_text(preview, reply_markup=confirm_split_keyboard())
+    await remember_bot_reply(tg_id, preview)
 
 
 async def handle_confirm(update: Update, state) -> None:
@@ -63,9 +66,13 @@ async def handle_confirm(update: Update, state) -> None:
     if text in ("no", "cancel", "n"):
         async with AsyncSessionLocal() as session:
             await StateService(session).go_idle(tg_id)
-        await msg.reply_text("Cancelled.")
+        reply = "Cancelled."
+        await msg.reply_text(reply)
+        await remember_bot_reply(tg_id, reply)
         return
-    await msg.reply_text("Tap Save / Cancel, or type yes / cancel.")
+    reply = "Tap Save / Cancel, or type yes / cancel."
+    await msg.reply_text(reply)
+    await remember_bot_reply(tg_id, reply)
 
 
 async def handle_edit_what(update: Update, state) -> None:
@@ -173,9 +180,11 @@ async def _save(update: Update, pending: dict[str, Any]) -> None:
             raw_message=pending.get("raw_message"),
         )
         await StateService(session).go_idle(tg_id)
-    await msg.reply_text(
+    text = (
         f"Split saved ✅ {expense.description or 'Expense'} — {format_inr(expense.amount)}"
     )
+    await msg.reply_text(text)
+    await remember_bot_reply(tg_id, text)
 
 
 async def save_from_callback(update: Update, pending: dict[str, Any]) -> None:

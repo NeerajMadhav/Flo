@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.core.exceptions import FloBaseException
@@ -18,6 +18,15 @@ def format_error(exc: Exception) -> str:
     return "Something went wrong. Try again."
 
 
+def _safe_amount(amount: Any) -> Decimal:
+    if amount is None:
+        return Decimal("0")
+    try:
+        return Decimal(str(amount))
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+
+
 def format_expense_preview(data: dict[str, Any] | ParsedMessage) -> str:
     if isinstance(data, ParsedMessage):
         amount = data.amount
@@ -30,7 +39,7 @@ def format_expense_preview(data: dict[str, Any] | ParsedMessage) -> str:
         cat = data.get("category") or "misc"
         date = data.get("date") or "today"
     return truncate_telegram(
-        f"📝 {desc}\nAmount: {format_inr(Decimal(str(amount or 0)))}\n"
+        f"📝 {desc}\nAmount: {format_inr(_safe_amount(amount))}\n"
         f"Category: {cat}\nDate: {date}\n\nSave this?"
     )
 
@@ -49,7 +58,7 @@ def format_split_preview(data: dict[str, Any] | ParsedMessage) -> str:
         payer = data.get("split_payer") or "You"
         stype = data.get("split_type") or "equal"
     return truncate_telegram(
-        f"🧾 {desc} {format_inr(Decimal(str(amount or 0)))}\n"
+        f"🧾 {desc} {format_inr(_safe_amount(amount))}\n"
         f"Paid by: {payer}\nSplit ({stype}) with: {people}\n\nSave this?"
     )
 

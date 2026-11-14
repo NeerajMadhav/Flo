@@ -1,6 +1,6 @@
 # Flo
 
-Telegram personal finance assistant for Indian users (`@PennyTrackerBot`).
+Telegram personal finance assistant for Indian users (`@Riruru_tracker_bot`).
 
 Logs expenses from plain English / Hinglish / Tenglish, handles bill splits (both debt directions), settlements, goals, and weekly/monthly reports.
 
@@ -8,7 +8,7 @@ Logs expenses from plain English / Hinglish / Tenglish, handles bill splits (bot
 
 - FastAPI + python-telegram-bot v21 (async)
 - SQLAlchemy 2.0 async (SQLite dev / Postgres prod)
-- OpenRouter NLP (PARSE / EDIT / CLARIFY / INSIGHT prompts)
+- OpenRouter NLP (PARSE / EDIT / CLARIFY / INSIGHT) with per-role model chains + global fallback
 - APScheduler (single Railway instance)
 
 ## Quick start
@@ -16,6 +16,7 @@ Logs expenses from plain English / Hinglish / Tenglish, handles bill splits (bot
 ```bash
 cp .env.example .env
 # Set TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, API_SECRET_KEY, TELEGRAM_WEBHOOK_SECRET
+# DATABASE_URL: leave SQLite for local, or paste a Neon pooled URL (sslmode=require)
 
 pip install -r requirements-dev.txt
 python -m app.core.seed

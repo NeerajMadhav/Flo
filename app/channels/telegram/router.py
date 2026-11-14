@@ -23,11 +23,13 @@ from app.channels.telegram.handlers import (
     settings as settings_handler,
     split,
 )
+from app.channels.telegram.memory import remember_bot_reply
 from app.channels.telegram.middleware import check_rate_limit
 from app.config import get_settings
 from app.core.concurrency import user_request_lock
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import FloBaseException, RateLimitExceededError, StateExpiredError
+from app.nlp.heuristics import try_heuristic_parse
 from app.nlp.validate import validate_parsed_for_write
 from app.services.audit_service import AuditService
 from app.services.category_service import CategoryService
@@ -172,13 +174,48 @@ async def dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None:
+    # Clear common phrases → skip OpenRouter (faster + survives free-tier 429s)
+    parsed = try_heuristic_parse(text)
+    # "same again" → re-parse last user expense/split line from conversation memory
+    if parsed is None and text.strip().lower() in (
+        "same",
+        "same again",
+        "again",
+        "same thing",
+        "one more",
+    ):
+        async with AsyncSessionLocal() as session:
+            ctx = await StateService(session).get_recent_context(tg_id)
+        for line in reversed(ctx.splitlines()):
+            if line.startswith("user:"):
+                prior = line[5:].strip()
+                if prior.lower() not in (
+                    "same",
+                    "same again",
+                    "again",
+                    "yes",
+                    "y",
+                    "ok",
+                ):
+                    parsed = try_heuristic_parse(prior)
+                    if parsed is not None:
+                        break
     async with AsyncSessionLocal() as session:
-        nlp = NLPService(session)
-        try:
-            parsed = await nlp.parse(user_id, tg_id, text)
-        except FloBaseException as e:
-            await update.effective_message.reply_text(format_error(e))
-            return
+        if parsed is None:
+            nlp = NLPService(session)
+            try:
+                parsed = await nlp.parse(user_id, tg_id, text)
+            except FloBaseException as e:
+                await update.effective_message.reply_text(format_error(e))
+                return
+        else:
+            log_event(
+                logger,
+                "nlp.heuristic_hit",
+                parse_type=parsed.type,
+                confidence=parsed.confidence,
+                tg_id=tg_id,
+            )
 
         if parsed.type == "settlement" and not (parsed.settled_person or "").strip():
             parsed.needs_clarification = True
@@ -192,9 +229,9 @@ async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None
             await StateService(session).set_state(
                 tg_id, "CLARIFYING", user_id=user_id, step_data=step
             )
-            await update.effective_message.reply_text(
-                parsed.clarification_question or "Can you clarify?"
-            )
+            reply = parsed.clarification_question or "Can you clarify?"
+            await update.effective_message.reply_text(reply)
+            await remember_bot_reply(tg_id, reply)
             return
 
         if parsed.type == "expense":
@@ -219,9 +256,9 @@ async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None
                 frequency=freq,
                 due_day=day,
             )
-            await update.effective_message.reply_text(
-                f"Recurring saved ✅ {RecurringService(session).format_line(row)}"
-            )
+            reply = f"Recurring saved ✅ {RecurringService(session).format_line(row)}"
+            await update.effective_message.reply_text(reply)
+            await remember_bot_reply(tg_id, reply)
         elif parsed.type == "greeting":
             user = await UserService(session).users.get_by_id(user_id)
             await fallback.handle_greeting(update, user.name if user else None)
@@ -229,16 +266,16 @@ async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None
             keyword = (parsed.description or "").strip()
             category = (parsed.category or "").strip()
             if not keyword or not category:
-                await update.effective_message.reply_text(
-                    "Tell me like: that medicine was groceries"
-                )
+                reply = "Tell me like: that medicine was groceries"
+                await update.effective_message.reply_text(reply)
+                await remember_bot_reply(tg_id, reply)
                 return
             await CategoryService(session).record_correction(
                 user_id, keyword[:128], category
             )
-            await update.effective_message.reply_text(
-                f"Got it — I'll remember '{keyword}' as {category}."
-            )
+            reply = f"Got it — I'll remember '{keyword}' as {category}."
+            await update.effective_message.reply_text(reply)
+            await remember_bot_reply(tg_id, reply)
         else:
             await fallback.handle_unknown(update)
 
@@ -269,7 +306,9 @@ async def _dispatch_callback_locked(update, query, data: str, tg_id: str) -> Non
         elif data == "expense:cancel":
             async with AsyncSessionLocal() as session:
                 await StateService(session).go_idle(tg_id)
-            await query.edit_message_text("Cancelled. Nothing saved.")
+            reply = "Cancelled. Nothing saved."
+            await query.edit_message_text(reply)
+            await remember_bot_reply(tg_id, reply)
         elif data == "expense:edit":
             async with AsyncSessionLocal() as session:
                 await StateService(session).set_state(
@@ -277,9 +316,9 @@ async def _dispatch_callback_locked(update, query, data: str, tg_id: str) -> Non
                 )
             from app.channels.telegram.keyboards import edit_field_keyboard
 
-            await query.edit_message_text(
-                "What do you want to change?", reply_markup=edit_field_keyboard()
-            )
+            reply = "What do you want to change?"
+            await query.edit_message_text(reply, reply_markup=edit_field_keyboard())
+            await remember_bot_reply(tg_id, reply)
         elif data == "split:confirm":
             await split.save_from_callback(update, pending)
         elif data == "split:edit":
@@ -287,19 +326,25 @@ async def _dispatch_callback_locked(update, query, data: str, tg_id: str) -> Non
                 await StateService(session).set_state(
                     tg_id, "EDIT_SPLIT_WHAT", user_id=state.user_id, pending_data=pending
                 )
-            await query.edit_message_text(
+            reply = (
                 "What do you want to change? Reply with: amount, people, description, or category."
             )
+            await query.edit_message_text(reply)
+            await remember_bot_reply(tg_id, reply)
         elif data == "split:cancel":
             async with AsyncSessionLocal() as session:
                 await StateService(session).go_idle(tg_id)
-            await query.edit_message_text("Cancelled.")
+            reply = "Cancelled."
+            await query.edit_message_text(reply)
+            await remember_bot_reply(tg_id, reply)
         elif data == "settle:confirm":
             await debt.save_from_callback(update, pending)
         elif data == "settle:cancel":
             async with AsyncSessionLocal() as session:
                 await StateService(session).go_idle(tg_id)
-            await query.edit_message_text("Cancelled.")
+            reply = "Cancelled."
+            await query.edit_message_text(reply)
+            await remember_bot_reply(tg_id, reply)
         elif data.startswith("edit:"):
             field = data.split(":", 1)[1]
             if field == "back":
@@ -310,9 +355,11 @@ async def _dispatch_callback_locked(update, query, data: str, tg_id: str) -> Non
                     await StateService(session).set_state(
                         tg_id, "CONFIRM_EXPENSE", user_id=state.user_id, pending_data=pending
                     )
+                preview = format_expense_preview(pending)
                 await query.edit_message_text(
-                    format_expense_preview(pending), reply_markup=confirm_expense_keyboard()
+                    preview, reply_markup=confirm_expense_keyboard()
                 )
+                await remember_bot_reply(tg_id, preview)
             else:
                 async with AsyncSessionLocal() as session:
                     step = dict(state.step_data or {})
@@ -324,7 +371,9 @@ async def _dispatch_callback_locked(update, query, data: str, tg_id: str) -> Non
                         pending_data=pending,
                         step_data=step,
                     )
-                await query.edit_message_text(f"Send the new {field}:")
+                reply = f"Send the new {field}:"
+                await query.edit_message_text(reply)
+                await remember_bot_reply(tg_id, reply)
         else:
             await query.edit_message_text("Unknown action.")
     except Exception as e:

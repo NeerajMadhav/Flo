@@ -59,9 +59,17 @@ class StateRepository:
         return row
 
     async def clear_to_idle(self, telegram_user_id: str) -> ConversationState:
+        """Idle + clear pending; keep recent_turns so follow-up chat retains context."""
+        row = await self.get(telegram_user_id)
+        turns = []
+        if row and isinstance(row.step_data, dict):
+            raw = row.step_data.get("recent_turns") or []
+            if isinstance(raw, list):
+                turns = raw
+        step: dict[str, Any] = {"recent_turns": turns} if turns else {}
         return await self.upsert(
             telegram_user_id,
             state="IDLE",
             pending_data=None,
-            step_data={},
+            step_data=step,
         )

@@ -6,6 +6,7 @@ from __future__ import annotations
 from telegram import Update
 
 from app.channels.telegram.handlers import debt as debt_handler
+from app.channels.telegram.memory import remember_bot_reply
 from app.core.database import AsyncSessionLocal
 from app.nlp.schemas import ParsedMessage
 from app.services.analytics_service import AnalyticsService
@@ -16,6 +17,7 @@ from app.services.user_service import UserService
 
 async def handle(update: Update, user_id: int, parsed: ParsedMessage) -> None:
     msg = update.effective_message
+    tg_id = str(update.effective_user.id)
     intent = parsed.query_intent or ""
     params = parsed.query_params or {}
 
@@ -29,24 +31,31 @@ async def handle(update: Update, user_id: int, parsed: ParsedMessage) -> None:
         async with AsyncSessionLocal() as session:
             goals = await GoalService(session).list_goals(user_id)
             if not goals:
-                await msg.reply_text("No goals yet. Try: save 50000 for new phone")
+                reply = "No goals yet. Try: save 50000 for new phone"
+                await msg.reply_text(reply)
+                await remember_bot_reply(tg_id, reply)
                 return
             svc = GoalService(session)
             text = "\n".join(svc.format_progress(g) for g in goals)
         await msg.reply_text(text)
+        await remember_bot_reply(tg_id, text)
         return
     if intent == "recurring_list":
         async with AsyncSessionLocal() as session:
             rows = await RecurringService(session).list_active(user_id)
             if not rows:
-                await msg.reply_text("No recurring expenses yet.")
+                reply = "No recurring expenses yet."
+                await msg.reply_text(reply)
+                await remember_bot_reply(tg_id, reply)
                 return
             svc = RecurringService(session)
             text = "\n".join(svc.format_line(r) for r in rows)
         await msg.reply_text(text)
+        await remember_bot_reply(tg_id, text)
         return
 
     async with AsyncSessionLocal() as session:
         user = await UserService(session).users.get_by_id(user_id)
         text = await AnalyticsService(session).handle_query(user, intent, params)
     await msg.reply_text(text)
+    await remember_bot_reply(tg_id, text)

@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -20,6 +21,14 @@ from app.config import get_settings
 
 class Base(DeclarativeBase):
     """SQLAlchemy declarative base for all models."""
+
+
+def _db_host(url: str) -> str:
+    """Hostname only — never log full URLs (they contain credentials)."""
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
 
 
 def _build_engine():
@@ -37,10 +46,17 @@ def _build_engine():
             # NullPool avoids holding stale file locks across async tasks
             kwargs["poolclass"] = NullPool
     else:
-        kwargs["pool_size"] = settings.db_pool_size
-        kwargs["max_overflow"] = settings.db_max_overflow
-        kwargs["pool_pre_ping"] = True  # drop dead connections under load
-        kwargs["pool_recycle"] = 1800
+        # Neon / PgBouncer pooler: avoid double-pooling + disable prepared stmts
+        host = _db_host(url)
+        using_pooler = "-pooler." in host or host.endswith("-pooler") or "-pooler" in host
+        if using_pooler:
+            kwargs["poolclass"] = NullPool
+            kwargs["connect_args"] = {"statement_cache_size": 0}
+        else:
+            kwargs["pool_size"] = settings.db_pool_size
+            kwargs["max_overflow"] = settings.db_max_overflow
+            kwargs["pool_pre_ping"] = True
+            kwargs["pool_recycle"] = 1800
 
     return create_async_engine(url, **kwargs), is_sqlite
 

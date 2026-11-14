@@ -17,8 +17,9 @@ from app.utils.guardrails import scope_summary_for_prompt
 # Model constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-FAST_MODEL  = "google/gemini-2.0-flash-exp:free"   # PARSE, EDIT, CLARIFY
-SMART_MODEL = "anthropic/claude-3-haiku"            # INSIGHT only
+# Defaults mirror app.config Settings chains (OpenRouter free, Nov 2026)
+FAST_MODEL = "baidu/ernie-5.5-flash-preview:free"  # PARSE primary
+SMART_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"  # INSIGHT primary
 
 
 # ──────────────────────────────────────────────────────────────────────────────
