@@ -19,6 +19,7 @@ from app.nlp.prompts import (
     build_edit_prompt,
     build_insight_prompt,
     build_parse_prompt,
+    build_reply_prompt,
 )
 from app.nlp.schemas import ParsedMessage
 from app.services.audit_service import AuditService
@@ -305,3 +306,44 @@ class NLPService:
         if isinstance(data, list):
             return [str(x) for x in data]
         return []
+
+    async def compose_reply(
+        self,
+        user_id: int,
+        telegram_user_id: str,
+        *,
+        user_message: str,
+        facts: str,
+        situation: str,
+        fallback: str,
+    ) -> str:
+        """
+        Speak layer: turn FACTS + context into a natural assistant reply.
+        On LLM failure, return `fallback` (never invent data).
+        """
+        user_svc = UserService(self.session)
+        state_svc = StateService(self.session)
+        system = build_reply_prompt(
+            user_context_block=await user_svc.get_prompt_context(user_id),
+            recent_turns_block=await state_svc.get_recent_context(telegram_user_id),
+            situation=situation,
+            user_message=sanitize_message(user_message)[:500],
+            facts_block=(facts or "")[:1500],
+        )
+        try:
+            content = await self._chat(
+                system,
+                "Write the Telegram reply now.",
+                chain=self.settings.parse_model_chain(),
+            )
+        except NLPParseError:
+            return fallback
+        text = (content or "").strip()
+        # Strip accidental fences / JSON wrappers from free models
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:\w+)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        text = text.strip().strip('"').strip()
+        if not text or len(text) > 900:
+            return fallback
+        return text

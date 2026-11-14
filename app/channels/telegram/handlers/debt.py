@@ -19,6 +19,7 @@ from app.services.state_service import StateService
 from app.services.user_service import UserService
 from app.utils.currency import format_inr
 from app.utils.guardrails import GuardrailCode, explain
+from app.utils.text_utils import is_affirm, is_deny
 
 
 async def show_confirmation(update: Update, user_id: int, parsed: ParsedMessage) -> None:
@@ -43,19 +44,19 @@ async def show_confirmation(update: Update, user_id: int, parsed: ParsedMessage)
 
 async def handle_confirm(update: Update, state) -> None:
     msg = update.effective_message
-    text = (msg.text or "").strip().lower()
+    raw = msg.text or ""
     tg_id = str(update.effective_user.id)
-    if text in ("yes", "y", "ok", "confirm"):
+    if is_affirm(raw):
         await _save(update, state.pending_data or {})
         return
-    if text in ("no", "cancel", "n"):
+    if is_deny(raw):
         async with AsyncSessionLocal() as session:
             await StateService(session).go_idle(tg_id)
         reply = "Cancelled."
         await msg.reply_text(reply)
         await remember_bot_reply(tg_id, reply)
         return
-    reply = "Type yes to confirm, or cancel."
+    reply = "Say yes / haan to confirm, or cancel."
     await msg.reply_text(reply)
     await remember_bot_reply(tg_id, reply)
 

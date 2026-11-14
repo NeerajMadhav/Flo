@@ -12,6 +12,7 @@ from telegram import Update
 from app.channels.telegram.formatters import format_expense_preview
 from app.channels.telegram.keyboards import confirm_expense_keyboard, edit_field_keyboard
 from app.channels.telegram.memory import remember_bot_reply
+from app.channels.telegram.presence import show_typing
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import ValidationError
 from app.nlp.heuristics import try_heuristic_parse
@@ -23,6 +24,7 @@ from app.services.state_service import StateService
 from app.services.user_service import UserService
 from app.utils.currency import parse_indian_amount
 from app.utils.guardrails import GuardrailCode, explain
+from app.utils.text_utils import is_affirm, is_deny, is_edit_intent
 
 
 def _pending_from_parsed(parsed: ParsedMessage) -> dict[str, Any]:
@@ -55,20 +57,20 @@ async def show_confirmation(update: Update, user_id: int, parsed: ParsedMessage,
 
 async def handle_confirm(update: Update, state) -> None:
     msg = update.effective_message
-    text = (msg.text or "").strip().lower()
+    raw_text = msg.text or ""
     tg_id = str(update.effective_user.id)
 
-    if text in ("yes", "y", "save", "ok", "✅"):
+    if is_affirm(raw_text):
         await _save(update, state.pending_data or {})
         return
-    if text in ("no", "cancel", "n", "❌"):
+    if is_deny(raw_text):
         async with AsyncSessionLocal() as session:
             await StateService(session).go_idle(tg_id)
         reply = "Cancelled. Nothing saved."
         await msg.reply_text(reply)
         await remember_bot_reply(tg_id, reply)
         return
-    if text in ("edit", "change"):
+    if is_edit_intent(raw_text):
         async with AsyncSessionLocal() as session:
             await StateService(session).set_state(
                 tg_id,
@@ -103,10 +105,22 @@ async def handle_confirm(update: Update, state) -> None:
         await remember_bot_reply(tg_id, preview)
         return
 
-    # Free-text edit via NLP
+    # Free text while confirming: maybe a brand-new ask, or an edit of pending
     async with AsyncSessionLocal() as session:
         nlp = NLPService(session)
-        parsed = await nlp.parse_edit(state.user_id, state.pending_data or {}, msg.text or "")
+        fresh = await nlp.parse(state.user_id, tg_id, msg.text or "")
+        if (
+            fresh.type in ("expense", "split", "settlement", "goal", "query")
+            and not fresh.needs_clarification
+            and float(fresh.confidence or 0) >= 0.75
+        ):
+            await StateService(session).go_idle(tg_id)
+            await _route_resolved_parse(update, state.user_id, fresh, msg.text or "")
+            return
+
+        parsed = await nlp.parse_edit(
+            state.user_id, state.pending_data or {}, msg.text or ""
+        )
         if parsed.needs_clarification:
             reply = parsed.clarification_question or explain(GuardrailCode.LOW_CONFIDENCE)
             await msg.reply_text(reply)
@@ -135,7 +149,55 @@ async def handle_field_select(update: Update, state) -> None:
 
 
 async def handle_field_value(update: Update, state) -> None:
-    await handle_confirm(update, state)
+    """Apply the field chosen in EDIT_FIELD_SELECT (amount/category/…)."""
+    msg = update.effective_message
+    tg_id = str(update.effective_user.id)
+    field = (state.step_data or {}).get("edit_field") or "amount"
+    raw = (msg.text or "").strip()
+    pending = dict(state.pending_data or {})
+
+    # Fresh expense while editing → abandon edit and let caller re-route
+    # (router checks heuristic before calling us when possible)
+
+    if field == "amount":
+        amt = parse_indian_amount(raw)
+        if amt is None or amt <= 0:
+            reply = "Send a valid amount, e.g. 350 or 1.5k"
+            await msg.reply_text(reply)
+            await remember_bot_reply(tg_id, reply)
+            return
+        pending["amount"] = str(amt)
+    elif field == "category":
+        if len(raw) < 2:
+            reply = "Send a category like fuel or food_outside"
+            await msg.reply_text(reply)
+            await remember_bot_reply(tg_id, reply)
+            return
+        pending["category"] = raw.lower().replace(" ", "_")[:64]
+    elif field == "description":
+        if len(raw) < 1:
+            reply = "Send a short description."
+            await msg.reply_text(reply)
+            await remember_bot_reply(tg_id, reply)
+            return
+        pending["description"] = raw[:128]
+    elif field == "date":
+        pending["date"] = raw[:32]
+    else:
+        await handle_confirm(update, state)
+        return
+
+    async with AsyncSessionLocal() as session:
+        await StateService(session).set_state(
+            tg_id,
+            "CONFIRM_EXPENSE",
+            user_id=state.user_id,
+            pending_data=pending,
+            step_data={},
+        )
+    preview = format_expense_preview(pending)
+    await msg.reply_text(preview, reply_markup=confirm_expense_keyboard())
+    await remember_bot_reply(tg_id, preview)
 
 
 async def _route_resolved_parse(
@@ -170,20 +232,14 @@ async def _route_resolved_parse(
 
 
 async def handle_clarification(update: Update, state) -> None:
+    """Resolve CLARIFYING via NLP (any phrasing); tiny heuristic only if models fail."""
     msg = update.effective_message
     tg_id = str(update.effective_user.id)
     step = state.step_data or {}
     answer = msg.text or ""
     original = step.get("original_message", "")
 
-    # If the user answered with a clear phrase, don't depend on OpenRouter
-    heuristic = try_heuristic_parse(answer)
-    if heuristic is not None and not heuristic.needs_clarification:
-        async with AsyncSessionLocal() as session:
-            await StateService(session).go_idle(tg_id)
-        await _route_resolved_parse(update, state.user_id, heuristic, original or answer)
-        return
-
+    await show_typing(update)
     async with AsyncSessionLocal() as session:
         nlp = NLPService(session)
         parsed = await nlp.parse_clarify(
@@ -192,15 +248,17 @@ async def handle_clarification(update: Update, state) -> None:
             step.get("clarification_question", ""),
             answer,
         )
-        if parsed.needs_clarification:
-            # Second chance: heuristic on answer after NLP failed/asked again
+        # If clarify failed, treat the answer as a fresh message (user may restate fully)
+        if parsed.needs_clarification and float(parsed.confidence or 0) < 0.5:
+            try:
+                parsed = await nlp.parse(state.user_id, tg_id, answer)
+            except Exception:
+                pass
+        if parsed.needs_clarification and float(parsed.confidence or 0) == 0.0:
             retry = try_heuristic_parse(answer)
-            if retry is not None and not retry.needs_clarification:
-                await StateService(session).go_idle(tg_id)
-                await _route_resolved_parse(
-                    update, state.user_id, retry, original or answer
-                )
-                return
+            if retry is not None:
+                parsed = retry
+        if parsed.needs_clarification:
             step["clarification_question"] = parsed.clarification_question
             await StateService(session).set_state(
                 tg_id,
@@ -213,8 +271,9 @@ async def handle_clarification(update: Update, state) -> None:
             await msg.reply_text(reply)
             await remember_bot_reply(tg_id, reply)
             return
+        await StateService(session).go_idle(tg_id)
 
-    await _route_resolved_parse(update, state.user_id, parsed, original)
+    await _route_resolved_parse(update, state.user_id, parsed, original or answer)
 
 
 def _pending_amount(pending: dict[str, Any]) -> Decimal:

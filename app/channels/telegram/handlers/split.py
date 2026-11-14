@@ -17,10 +17,12 @@ from app.core.database import AsyncSessionLocal
 from app.core.exceptions import ValidationError
 from app.nlp.schemas import ParsedMessage
 from app.nlp.validate import validate_parsed_for_write
+from app.services.nlp_service import NLPService
 from app.services.split_service import SplitService
 from app.services.state_service import StateService
 from app.services.user_service import UserService
 from app.utils.currency import format_inr, parse_indian_amount
+from app.utils.text_utils import is_affirm, is_deny
 
 
 def _pending_from_parsed(parsed: ParsedMessage) -> dict[str, Any]:
@@ -58,19 +60,40 @@ async def show_confirmation(
 
 async def handle_confirm(update: Update, state) -> None:
     msg = update.effective_message
-    text = (msg.text or "").strip().lower()
+    raw = msg.text or ""
     tg_id = str(update.effective_user.id)
-    if text in ("yes", "y", "save", "ok"):
+    if is_affirm(raw):
         await _save(update, state.pending_data or {})
         return
-    if text in ("no", "cancel", "n"):
+    if is_deny(raw):
         async with AsyncSessionLocal() as session:
             await StateService(session).go_idle(tg_id)
         reply = "Cancelled."
         await msg.reply_text(reply)
         await remember_bot_reply(tg_id, reply)
         return
-    reply = "Tap Save / Cancel, or type yes / cancel."
+    # Natural edit of pending split (any phrasing) via NLP
+    async with AsyncSessionLocal() as session:
+        nlp = NLPService(session)
+        parsed = await nlp.parse_edit(state.user_id, state.pending_data or {}, raw)
+        if not parsed.needs_clarification and parsed.type == "split":
+            pending = dict(state.pending_data or {})
+            if parsed.amount is not None:
+                pending["amount"] = str(parsed.amount)
+            if parsed.description:
+                pending["description"] = parsed.description
+            if parsed.category:
+                pending["category"] = parsed.category
+            if parsed.split_with:
+                pending["split_with"] = list(parsed.split_with)
+            await StateService(session).set_state(
+                tg_id, "CONFIRM_SPLIT", user_id=state.user_id, pending_data=pending
+            )
+            preview = format_split_preview(pending)
+            await msg.reply_text(preview, reply_markup=confirm_split_keyboard())
+            await remember_bot_reply(tg_id, preview)
+            return
+    reply = "Tap Save / Cancel, or say what to change (e.g. amount 800)."
     await msg.reply_text(reply)
     await remember_bot_reply(tg_id, reply)
 
