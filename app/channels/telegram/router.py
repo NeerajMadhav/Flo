@@ -35,9 +35,10 @@ from app.services.nlp_service import NLPService
 from app.services.recurring_service import RecurringService
 from app.services.state_service import StateService
 from app.services.user_service import UserService
+from app.utils.guardrails import GuardrailCode, check_topic_scope, explain
 from app.utils.idempotency import update_id_cache
-from app.utils.logger import get_logger, log_event, get_request_id, set_request_id
-from app.utils.sanitizer import looks_like_injection, sanitize_message
+from app.utils.logger import get_logger, get_request_id, log_event, set_request_id
+from app.utils.sanitizer import injection_match, sanitize_message
 
 logger = get_logger("flo.telegram")
 webhook_router = APIRouter()
@@ -69,25 +70,53 @@ async def dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not msg or not user:
         return
     if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
-        await msg.reply_text("Flo works in private chats only.")
+        await msg.reply_text(explain(GuardrailCode.PRIVATE_CHAT_ONLY))
         return
 
     tg_id = str(user.id)
     try:
         await check_rate_limit(tg_id)
     except RateLimitExceededError as e:
-        await _audit_security("rate_limit.exceeded", tg_id=tg_id)
+        await _audit_security(
+            "rate_limit.exceeded", tg_id=tg_id, guardrail=GuardrailCode.RATE_LIMIT.value
+        )
         await msg.reply_text(e.message)
         return
 
     raw = msg.text or ""
-    if looks_like_injection(raw):
-        await _audit_security("injection.detected", tg_id=tg_id)
-        await msg.reply_text("I couldn't understand that. Try logging an expense like: petrol 250")
+    if len(raw) > get_settings().max_message_length:
+        await msg.reply_text(explain(GuardrailCode.MESSAGE_TOO_LONG))
         return
+    matched = injection_match(raw)
+    if matched:
+        await _audit_security(
+            "injection.detected",
+            tg_id=tg_id,
+            guardrail=GuardrailCode.INJECTION.value,
+            pattern=matched[:80],
+        )
+        await msg.reply_text(explain(GuardrailCode.INJECTION))
+        return
+
+    # Topical / finance-scope rail (before NLP) — investment advice, off-topic, PII, crisis
+    scope_hit = check_topic_scope(raw)
+    if scope_hit is not None:
+        event = (
+            "crisis.detected"
+            if scope_hit == GuardrailCode.CRISIS
+            else "scope.blocked"
+        )
+        await _audit_security(
+            event,
+            tg_id=tg_id,
+            guardrail=scope_hit.value,
+        )
+        await msg.reply_text(explain(scope_hit))
+        return
+
     text = sanitize_message(raw)
     if not text:
-        await msg.reply_text("What would you like to log?")
+        await msg.reply_text(explain(GuardrailCode.EMPTY_MESSAGE))
         return
 
     # Serialize per-user so state machine never interleaves under concurrent load
@@ -153,7 +182,7 @@ async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None
 
         if parsed.type == "settlement" and not (parsed.settled_person or "").strip():
             parsed.needs_clarification = True
-            parsed.clarification_question = "Who did you settle with?"
+            parsed.clarification_question = explain(GuardrailCode.SETTLEMENT_NO_PERSON)
 
         if parsed.needs_clarification:
             step = {

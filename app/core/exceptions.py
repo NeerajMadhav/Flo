@@ -72,14 +72,29 @@ class CategoryNotFoundError(FloBaseException):
 
 class RateLimitExceededError(FloBaseException):
     def __init__(self) -> None:
-        super().__init__("You're sending messages too fast. Wait a few seconds.")
+        # Lazy import — avoids circular import at module load
+        from app.utils.guardrails import GuardrailCode, explain
+
+        super().__init__(explain(GuardrailCode.RATE_LIMIT))
 
 
 class NLPParseError(FloBaseException):
     def __init__(self) -> None:
-        super().__init__("I couldn't understand that. Try again with an amount and description.")
+        from app.utils.guardrails import GuardrailCode, explain
+
+        super().__init__(explain(GuardrailCode.NLP_UNAVAILABLE))
 
 
 class StateExpiredError(FloBaseException):
     def __init__(self) -> None:
-        super().__init__("Starting fresh — what would you like to log?")
+        from app.utils.guardrails import GuardrailCode, explain
+
+        super().__init__(explain(GuardrailCode.STATE_EXPIRED))
+
+
+class GuardrailBlockedError(FloBaseException):
+    """User hit a named safety rail — message already explains which one."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        self.code = code
+        super().__init__(message)

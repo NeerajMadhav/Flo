@@ -10,6 +10,7 @@ from app.channels.telegram.handlers import onboarding, settings as settings_hand
 from app.core.database import AsyncSessionLocal
 from app.services.state_service import StateService
 from app.services.user_service import UserService
+from app.utils.guardrails import GuardrailCode, explain, intro_blurb
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -24,7 +25,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await states.go_idle(tg_id)
             summary = await users.get_welcome_back_summary(user.id)
             await update.effective_message.reply_text(
-                summary + "\n\nWhat would you like to log?"
+                f"{intro_blurb()}\n\n{summary}\n\n"
+                f"What would you like to log, {user.name or 'friend'}?"
             )
             return
         await states.set_state(tg_id, "NEW", user_id=user.id)
@@ -35,12 +37,15 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     tg_id = str(update.effective_user.id)
     async with AsyncSessionLocal() as session:
         await StateService(session).go_idle(tg_id)
-    await update.effective_message.reply_text("Cancelled. Starting fresh — what would you like to log?")
+    await update.effective_message.reply_text(
+        "Cancelled. " + explain(GuardrailCode.STATE_EXPIRED)
+    )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Flo helps you track money on Telegram.\n\n"
+        intro_blurb()
+        + "\n\n"
         "Log: petrol 250\n"
         "Split: lunch 600 split with Rahul\n"
         "Ask: how much did I spend this month\n"

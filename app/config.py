@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     debug: bool = False  # MUST stay false in production (SQL echo leaks PII)
     app_version: str = "1.0.0"
     log_level: str = "INFO"
+    bot_display_name: str = "Riruru"  # user-facing persona (product = Flo)
     webhook_rate_limit_per_min: int = 120
 
     # Scheduler

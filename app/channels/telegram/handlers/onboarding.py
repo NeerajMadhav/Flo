@@ -30,7 +30,7 @@ async def handle(update: Update, state_name: str) -> None:
         if state_name in ("NEW", "IDLE") and not user.onboarded:
             await states.set_state(tg_id, "ONBOARD_NAME", user_id=user.id)
             await msg.reply_text(
-                "Hey! I'm Flo — your personal finance buddy. 💰\nWhat's your name?"
+                "Hey! I'm Riruru — Flo's personal finance buddy. 💰\nWhat's your name?"
             )
             return
 

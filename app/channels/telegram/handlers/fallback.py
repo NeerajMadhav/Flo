@@ -5,25 +5,19 @@ from __future__ import annotations
 
 from telegram import Update
 
+from app.utils.guardrails import GuardrailCode, bot_name, explain
+
 
 async def handle_unknown(update: Update) -> None:
-    await update.effective_message.reply_text(
-        "I didn't catch that. Try:\n"
-        "• petrol 250\n"
-        "• lunch 600 split with Rahul\n"
-        "• how much did I spend this month\n"
-        "• who owes me"
-    )
+    await update.effective_message.reply_text(explain(GuardrailCode.UNKNOWN))
 
 
 async def handle_greeting(update: Update, name: str | None = None) -> None:
     who = name or "there"
     await update.effective_message.reply_text(
-        f"Hey {who}! 👋 What would you like to log?"
+        f"Hey {who}! I'm {bot_name()} 👋 What would you like to log?"
     )
 
 
 async def handle_non_text(update: Update) -> None:
-    await update.effective_message.reply_text(
-        "I only read text for now — try typing your expense."
-    )
+    await update.effective_message.reply_text(explain(GuardrailCode.NON_TEXT))

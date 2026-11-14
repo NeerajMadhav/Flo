@@ -24,6 +24,7 @@ from app.services.audit_service import AuditService
 from app.services.category_service import CategoryService
 from app.services.state_service import StateService
 from app.services.user_service import UserService
+from app.utils.guardrails import GuardrailCode, explain
 from app.utils.logger import get_logger, log_event
 from app.utils.sanitizer import sanitize_message
 
@@ -121,9 +122,7 @@ class NLPService:
             # Blueprint: confidence < 0.7 must enter CLARIFYING, never confirm
             parsed.needs_clarification = True
             if not parsed.clarification_question:
-                parsed.clarification_question = (
-                    "Just to confirm — what was it for, and how much?"
-                )
+                parsed.clarification_question = explain(GuardrailCode.LOW_CONFIDENCE)
         if conf < _LOW_CONFIDENCE:
             await self._audit.record(
                 "nlp.parse.low_confidence",
@@ -151,9 +150,7 @@ class NLPService:
             type="unknown",
             confidence=0.0,
             needs_clarification=True,
-            clarification_question=(
-                "I didn't catch that — what did you spend and how much?"
-            ),
+            clarification_question=explain(GuardrailCode.NLP_UNAVAILABLE),
         )
 
     async def _record_parse_failure(self, user_id: int, *, mode: str) -> None:

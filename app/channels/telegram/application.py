@@ -52,7 +52,7 @@ async def setup_bot_commands(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             BotCommand("start", "Start or welcome back"),
-            BotCommand("help", "How to use Flo"),
+            BotCommand("help", "How to use Riruru (Flo)"),
             BotCommand("settings", "View / update profile"),
             BotCommand("cancel", "Cancel current action"),
         ]

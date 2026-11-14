@@ -17,13 +17,14 @@ from app.services.debt_service import DebtService
 from app.services.state_service import StateService
 from app.services.user_service import UserService
 from app.utils.currency import format_inr
+from app.utils.guardrails import GuardrailCode, explain
 
 
 async def show_confirmation(update: Update, user_id: int, parsed: ParsedMessage) -> None:
     msg = update.effective_message
     tg_id = str(update.effective_user.id)
     if not (parsed.settled_person or "").strip():
-        raise ValidationError("Who did you settle with?")
+        raise ValidationError(explain(GuardrailCode.SETTLEMENT_NO_PERSON))
     pending = {
         "type": "settlement",
         "settled_person": parsed.settled_person,
@@ -59,7 +60,7 @@ async def _save(update: Update, pending: dict[str, Any]) -> None:
     tg_id = str(update.effective_user.id)
     person = (pending.get("settled_person") or "").strip()
     if not person:
-        raise ValidationError("Who did you settle with?")
+        raise ValidationError(explain(GuardrailCode.SETTLEMENT_NO_PERSON))
     async with AsyncSessionLocal() as session:
         user = await UserService(session).get_profile(tg_id)
         amt_s = pending.get("settled_amount")

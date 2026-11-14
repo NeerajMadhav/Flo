@@ -61,6 +61,15 @@ def sanitize_for_prompt(raw: str | None, *, max_len: int = 200) -> str:
 
 def looks_like_injection(raw: str) -> bool:
     """True if the raw message matches known injection patterns."""
+    return injection_match(raw) is not None
+
+
+def injection_match(raw: str) -> str | None:
+    """Return the matched injection pattern string, or None if clean."""
     if not raw:
-        return False
-    return any(p.search(raw) for p in _COMPILED)
+        return None
+    for pat in _COMPILED:
+        m = pat.search(raw)
+        if m:
+            return m.group(0)
+    return None

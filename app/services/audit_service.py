@@ -30,6 +30,8 @@ _AUDIT_EVENTS = frozenset(
         "auth.login_failed",
         "injection.detected",
         "rate_limit.exceeded",
+        "scope.blocked",
+        "crisis.detected",
         "alert.triggered",
         "nlp.parse.failed",
         "llm.unavailable",
