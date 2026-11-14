@@ -26,9 +26,21 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if user.onboarded:
             await states.go_idle(tg_id)
             summary = await users.get_welcome_back_summary(user.id)
+            raw_name = (user.name or "").strip()
+            greet_names = {"hi", "hey", "hello", "ok", "okay", "yes", "no"}
+            display = (
+                "friend"
+                if not raw_name or raw_name.lower() in greet_names
+                else raw_name
+            )
+            name_hint = (
+                "\n(Tip: say set name Neeraj if I should call you something else.)"
+                if display == "friend" and raw_name.lower() in greet_names
+                else ""
+            )
             onboarded_reply = (
                 f"{intro_blurb()}\n\n{summary}\n\n"
-                f"What would you like to log, {user.name or 'friend'}?"
+                f"What would you like to log, {display}?{name_hint}"
             )
         else:
             await states.set_state(tg_id, "NEW", user_id=user.id)

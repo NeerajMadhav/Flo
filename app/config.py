@@ -70,23 +70,24 @@ class Settings(BaseSettings):
     # role-specific fallbacks; nlp_global_fallback_model is the last resort for all.
     openrouter_api_key: str = Field(..., min_length=8)
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    # PARSE / EDIT / CLARIFY chain (JSON finance parser)
+    # PARSE — JSON quality first (ernie), then fast free fallbacks (probed)
     nlp_parse_model: str = "baidu/ernie-5.5-flash-preview:free"
-    nlp_parse_fallback_1: str = "google/gemma-4-31b-it:free"
-    nlp_parse_fallback_2: str = "liquid/lfm-3-1.7b:free"
-    nlp_parse_fallback_3: str = "inclusionai/ling-3.2-flash:free"
+    nlp_parse_fallback_1: str = "liquid/lfm-3-1.7b:free"
+    nlp_parse_fallback_2: str = "nvidia/nemotron-3.5-lightning:free"
+    nlp_parse_fallback_3: str = "google/gemma-4-26b-a4b-it:free"
     # REPORT / INSIGHT chain
-    nlp_report_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
-    nlp_report_fallback_1: str = "thinkingmachines/inkling-2-small:free"
-    nlp_report_fallback_2: str = "nvidia/nemotron-3.5-super-vl:free"
-    nlp_report_fallback_3: str = "baidu/ernie-5.5-flash-preview:free"
+    nlp_report_model: str = "nvidia/nemotron-3.5-lightning:free"
+    nlp_report_fallback_1: str = "baidu/ernie-5.5-flash-preview:free"
+    nlp_report_fallback_2: str = "google/gemma-4-26b-a4b-it:free"
+    nlp_report_fallback_3: str = "thinkingmachines/inkling-2-small:free"
     # Global last-resort (tried after every role chain is exhausted)
     nlp_global_fallback_model: str = "openrouter/free"
     # Legacy alias — still accepted via env NLP_FALLBACK_MODEL
     nlp_fallback_model: str | None = None
-    nlp_max_tokens: int = 500
+    nlp_max_tokens: int = 420
     nlp_temperature: float = 0.1
-    nlp_timeout_seconds: int = 10
+    # Per-model HTTP timeout — keep tight so fallbacks don't stack to ~20s
+    nlp_timeout_seconds: int = 7
     nlp_max_retries: int = 1
     nlp_max_concurrent: int = 8  # max parallel OpenRouter calls process-wide
 

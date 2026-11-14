@@ -116,8 +116,8 @@ class NLPService:
                                 model=m,
                                 attempt=attempt,
                             )
-                            # Brief backoff before next model in the chain
-                            await asyncio.sleep(min(2.0 * (attempt + 1), 6.0))
+                            # Short backoff — long sleeps blow past ~2–3s UX budget
+                            await asyncio.sleep(min(0.35 * (attempt + 1), 1.0))
                             continue
                         resp.raise_for_status()
                         data = resp.json()
@@ -225,7 +225,14 @@ class NLPService:
             parsed = ParsedMessage.model_validate(data)
             await self._record_parse_outcome(user_id, parsed, mode="parse")
             return parsed
-        except Exception:
+        except Exception as e:
+            log_event(
+                logger,
+                "nlp.parse.json_invalid",
+                level=logging.WARNING,
+                error=str(e)[:120],
+                snippet=(content or "")[:160].replace("\n", " "),
+            )
             await self._record_parse_failure(user_id, mode="parse")
             return self._clarify_fallback()
 

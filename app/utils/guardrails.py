@@ -185,9 +185,8 @@ def explain(code: GuardrailCode | str, **ctx: Any) -> str:
             f"what was it for, and how much?"
         ),
         GuardrailCode.NLP_UNAVAILABLE.value: (
-            f"I'm {name} and I couldn't parse that just now. Try a clear line:\n"
-            f"• petrol 250\n• lunch 600 split with Rahul\n"
-            f"• save 50000 for phone\n• Rahul paid me 200"
+            f"I'm {name} and I'm a bit stuck 😅 Send one clear line — "
+            f"like petrol 250 or fuel 578 split with Surya."
         ),
         GuardrailCode.NON_TEXT.value: (
             f"I'm {name}. I only read text for now — type your expense."

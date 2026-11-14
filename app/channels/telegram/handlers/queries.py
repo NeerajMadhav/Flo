@@ -1,44 +1,42 @@
 # app/channels/telegram/handlers/queries.py
-"""Query-intent routing — act on ledger, then speak naturally."""
+"""Query-intent routing — act on ledger, reply fast (no second LLM)."""
 
 from __future__ import annotations
 
 from telegram import Update
 
+from app.channels.telegram.formatters import category_emoji
 from app.channels.telegram.handlers import debt as debt_handler
 from app.channels.telegram.memory import remember_bot_reply
-from app.channels.telegram.presence import show_typing
 from app.core.database import AsyncSessionLocal
 from app.nlp.schemas import ParsedMessage
 from app.services.analytics_service import AnalyticsService
+from app.services.category_service import CategoryService
+from app.services.expense_service import ExpenseService
 from app.services.goal_service import GoalService
-from app.services.nlp_service import NLPService
 from app.services.recurring_service import RecurringService
 from app.services.user_service import UserService
+from app.utils.currency import format_inr
+from app.utils.date_utils import month_end, month_start
 
 
-async def _speak_facts(
-    update: Update, user_id: int, facts: str, *, situation: str
-) -> None:
-    """Deterministic FACTS in → natural assistant reply out."""
-    msg = update.effective_message
+async def _reply(update: Update, text: str) -> None:
     tg_id = str(update.effective_user.id)
-    await show_typing(update)
-    async with AsyncSessionLocal() as session:
-        reply = await NLPService(session).compose_reply(
-            user_id,
-            tg_id,
-            user_message=msg.text or "",
-            facts=facts,
-            situation=situation,
-            fallback=facts,
-        )
-    await msg.reply_text(reply)
-    await remember_bot_reply(tg_id, reply)
+    await update.effective_message.reply_text(text)
+    await remember_bot_reply(tg_id, text)
+
+
+def _format_expense_line(e) -> str:
+    slug = e.category.slug if getattr(e, "category", None) else "misc"
+    emo = (e.category.icon_emoji if getattr(e, "category", None) else None) or category_emoji(
+        slug
+    )
+    amt = format_inr(e.amount)
+    desc = e.description or "Expense"
+    return f"{emo} {desc} — {amt} · {e.date}"
 
 
 async def handle(update: Update, user_id: int, parsed: ParsedMessage) -> None:
-    msg = update.effective_message
     intent = parsed.query_intent or ""
     params = parsed.query_params or {}
 
@@ -48,38 +46,106 @@ async def handle(update: Update, user_id: int, parsed: ParsedMessage) -> None:
     if intent in ("i_owe_who", "net_balance_contact"):
         await debt_handler.show_i_owe(update, user_id, params.get("contact"))
         return
+    if intent in ("list_categories", "help_categories", "categories"):
+        async with AsyncSessionLocal() as session:
+            cats = await CategoryService(session).list_display(user_id)
+        if not cats:
+            await _reply(update, "No categories yet — I'll sort as you log.")
+            return
+        lines = [
+            f"{c.icon_emoji or category_emoji(c.slug)} {c.display_name}"
+            for c in cats[:24]
+        ]
+        await _reply(
+            update,
+            "Categories I know:\n"
+            + "\n".join(lines)
+            + "\n\nJust say what it was — I'll pick one 🙂",
+        )
+        return
+
+    if intent == "list_expenses":
+        async with AsyncSessionLocal() as session:
+            rows = await ExpenseService(session).repo.list_for_period(
+                user_id, month_start(), month_end()
+            )
+        if not rows:
+            await _reply(update, "No expenses this month yet. Log one like: petrol 250 ⛽")
+            return
+        # Newest first
+        rows = sorted(rows, key=lambda e: (e.date, e.id), reverse=True)
+        lines = [_format_expense_line(e) for e in rows[:15]]
+        extra = f"\n…and {len(rows) - 15} more" if len(rows) > 15 else ""
+        await _reply(
+            update,
+            f"📋 This month ({len(rows)}):\n"
+            + "\n".join(lines)
+            + extra
+            + "\n\nTo remove the newest: delete last expense",
+        )
+        return
+
+    if intent == "manage_expenses":
+        async with AsyncSessionLocal() as session:
+            last = await ExpenseService(session).repo.last_expense(user_id)
+        tip = ""
+        if last:
+            tip = f"\n\nLatest: {_format_expense_line(last)}"
+        await _reply(
+            update,
+            "Yes — you can manage logged spends:\n"
+            "• list expenses — see this month\n"
+            "• delete last expense — remove the newest one\n"
+            "• Or correct category: that medicine was groceries"
+            + tip,
+        )
+        return
+
+    if intent == "delete_last_expense":
+        async with AsyncSessionLocal() as session:
+            svc = ExpenseService(session)
+            last = await svc.repo.last_expense(user_id)
+            if not last:
+                await _reply(update, "Nothing to delete — no expenses logged yet.")
+                return
+            line = _format_expense_line(last)
+            await svc.soft_delete(user_id, last.id)
+        await _reply(update, f"🗑️ Removed:\n{line}\n\n(Say list expenses to see what's left.)")
+        return
+
     if intent == "goal_progress":
         async with AsyncSessionLocal() as session:
             goals = await GoalService(session).list_goals(user_id)
             if not goals:
-                await _speak_facts(
-                    update,
-                    user_id,
-                    "No goals yet. Suggest: save 50000 for new phone",
-                    situation="goal_progress_empty",
-                )
+                await _reply(update, "No goals yet. Try: save 50000 for new phone 🎯")
                 return
             svc = GoalService(session)
-            text = "\n".join(svc.format_progress(g) for g in goals)
-        await _speak_facts(update, user_id, text, situation="goal_progress")
+            text = "🎯 Goals:\n" + "\n".join(svc.format_progress(g) for g in goals)
+        await _reply(update, text)
         return
     if intent == "recurring_list":
         async with AsyncSessionLocal() as session:
             rows = await RecurringService(session).list_active(user_id)
             if not rows:
-                await _speak_facts(
-                    update,
-                    user_id,
-                    "No recurring expenses yet.",
-                    situation="recurring_empty",
-                )
+                await _reply(update, "No recurring expenses yet.")
                 return
             svc = RecurringService(session)
-            text = "\n".join(svc.format_line(r) for r in rows)
-        await _speak_facts(update, user_id, text, situation="recurring_list")
+            text = "🔁 Recurring:\n" + "\n".join(svc.format_line(r) for r in rows)
+        await _reply(update, text)
+        return
+    if intent == "help":
+        await _reply(
+            update,
+            "I can:\n"
+            "• Log: petrol 250 ⛽\n"
+            "• Split: fuel 578 split with Surya\n"
+            "• List: list expenses / what categories\n"
+            "• Fix: delete last expense\n"
+            "• Ask: how much this month · who owes me",
+        )
         return
 
     async with AsyncSessionLocal() as session:
         user = await UserService(session).users.get_by_id(user_id)
         text = await AnalyticsService(session).handle_query(user, intent, params)
-    await _speak_facts(update, user_id, text, situation=f"query:{intent or 'general'}")
+    await _reply(update, text)

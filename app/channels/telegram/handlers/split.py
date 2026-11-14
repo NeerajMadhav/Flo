@@ -21,7 +21,7 @@ from app.services.nlp_service import NLPService
 from app.services.split_service import SplitService
 from app.services.state_service import StateService
 from app.services.user_service import UserService
-from app.utils.currency import format_inr, parse_indian_amount
+from app.utils.currency import parse_indian_amount
 from app.utils.text_utils import is_affirm, is_deny
 
 
@@ -203,9 +203,9 @@ async def _save(update: Update, pending: dict[str, Any]) -> None:
             raw_message=pending.get("raw_message"),
         )
         await StateService(session).go_idle(tg_id)
-    text = (
-        f"Split saved ✅ {expense.description or 'Expense'} — {format_inr(expense.amount)}"
-    )
+    # Reuse preview shares (drop the Save prompt)
+    summary = format_split_preview(pending).replace("\n\nSave this?", "").strip()
+    text = f"Split saved ✅\n{summary}"
     await msg.reply_text(text)
     await remember_bot_reply(tg_id, text)
 

@@ -131,12 +131,14 @@ class UserService:
             return "Welcome back! 👋"
         start, end = month_start(), month_end()
         count, total = await self.expenses.count_this_month(user_id, start, end)
-        name = user.name or "there"
+        raw = (user.name or "").strip()
+        greetish = {"hi", "hey", "hello", "ok", "okay", "yes", "no", "friend"}
+        name = "there" if not raw or raw.lower() in greetish else raw
         if count == 0:
-            return f"Welcome back, {name}! 👋 You haven't logged anything this month yet."
+            return f"Welcome back, {name}! 👋\nNo expenses logged this month yet."
         return (
-            f"Welcome back, {name}! 👋 You've logged {count} expenses this month "
-            f"({format_inr(total)})."
+            f"Welcome back, {name}! 👋\n"
+            f"This month: {count} expenses · {format_inr(total)}"
         )
 
     async def set_active(self, telegram_user_id: str, active: bool) -> None:

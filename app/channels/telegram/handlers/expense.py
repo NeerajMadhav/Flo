@@ -159,6 +159,27 @@ async def handle_field_value(update: Update, state) -> None:
     # Fresh expense while editing → abandon edit and let caller re-route
     # (router checks heuristic before calling us when possible)
 
+    # User pasted a full new log while editing → abandon edit and re-parse
+    if (
+        any(ch.isdigit() for ch in raw)
+        and len(raw.split()) >= 2
+        and field in ("category", "description", "date")
+    ):
+        async with AsyncSessionLocal() as session:
+            await StateService(session).go_idle(tg_id)
+            nlp = NLPService(session)
+            try:
+                fresh = await nlp.parse(state.user_id, tg_id, raw)
+            except Exception:
+                fresh = None
+        if fresh is not None and not fresh.needs_clarification:
+            await _route_resolved_parse(update, state.user_id, fresh, raw)
+            return
+        reply = "Got it — starting fresh. Send the expense again?"
+        await msg.reply_text(reply)
+        await remember_bot_reply(tg_id, reply)
+        return
+
     if field == "amount":
         amt = parse_indian_amount(raw)
         if amt is None or amt <= 0:
@@ -169,7 +190,7 @@ async def handle_field_value(update: Update, state) -> None:
         pending["amount"] = str(amt)
     elif field == "category":
         if len(raw) < 2:
-            reply = "Send a category like fuel or food_outside"
+            reply = "Send a category like fuel or food_outside ⛽"
             await msg.reply_text(reply)
             await remember_bot_reply(tg_id, reply)
             return

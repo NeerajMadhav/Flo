@@ -30,6 +30,7 @@ from app.config import get_settings
 from app.core.concurrency import user_request_lock
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import FloBaseException, RateLimitExceededError, StateExpiredError
+from app.nlp.fast_intent import try_fast_intent
 from app.nlp.heuristics import try_heuristic_parse
 from app.nlp.validate import validate_parsed_for_write
 from app.services.audit_service import AuditService
@@ -181,7 +182,13 @@ async def dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     await settings_handler.handle(update, state)
                 elif name == "IDLE":
                     lower = text.lower()
-                    if lower.startswith(("set income", "set budget", "set name")):
+                    if lower.startswith(("set income", "set budget", "set name")) or (
+                        settings_handler.extract_name_update(text) is not None
+                        and any(
+                            k in lower
+                            for k in ("call me", "my name", "set name", "i'm ", "i am ")
+                        )
+                    ):
                         await settings_handler.handle(update, state)
                     else:
                         await _idle_nlp(update, db_user.id, tg_id, text)
@@ -197,8 +204,15 @@ async def dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None:
     """
     Listen → understand → act → speak.
-    LLM parse first (any phrasing + recent context); heuristic only if model is down.
+    Fast intents first (list/manage), then LLM; heuristic only if model is down.
     """
+    # Instant path for unambiguous asks — no OpenRouter round-trip
+    fast = try_fast_intent(text)
+    if fast is not None:
+        if fast.type == "query":
+            await queries.handle(update, user_id, fast)
+            return
+
     await show_typing(update)
     async with AsyncSessionLocal() as session:
         nlp = NLPService(session)
@@ -208,21 +222,26 @@ async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None
             await update.effective_message.reply_text(format_error(e))
             return
 
-        # Model unavailable / empty → last-resort simple "petrol 250" shape only
+        # Model unavailable / bad JSON → fast intent again, then desc+amount heuristic
         if (
             parsed.needs_clarification
             and parsed.confidence == 0.0
             and parsed.type in ("unknown", "expense")
         ):
-            fallback = try_heuristic_parse(text)
-            if fallback is not None:
-                log_event(
-                    logger,
-                    "nlp.heuristic_fallback",
-                    parse_type=fallback.type,
-                    tg_id=tg_id,
-                )
-                parsed = fallback
+            again = try_fast_intent(text)
+            if again is not None:
+                parsed = again
+            else:
+                # Do NOT name this `fallback` — that shadows handlers.fallback
+                heuristic = try_heuristic_parse(text)
+                if heuristic is not None:
+                    log_event(
+                        logger,
+                        "nlp.heuristic_fallback",
+                        parse_type=heuristic.type,
+                        tg_id=tg_id,
+                    )
+                    parsed = heuristic
 
         if parsed.type == "settlement" and not (parsed.settled_person or "").strip():
             parsed.needs_clarification = True
