@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: flo
+      POSTGRES_PASSWORD: flo
+      POSTGRES_DB: flo
+    ports:
+      - "5432:5432"
+    volumes:
+      - flo_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://flo:flo@postgres:5432/flo
+      BOT_MODE: polling
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  flo_pg:
