@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
@@ -26,10 +27,13 @@ from app.channels.telegram.handlers import (
 from app.channels.telegram.memory import remember_bot_reply
 from app.channels.telegram.middleware import check_rate_limit
 from app.channels.telegram.presence import show_typing
+from app.channels.telegram.replies import bind_ticket, current_ticket, send as reply_send
+from app.channels.telegram.turn_text import use_turn_text, user_text
 from app.config import get_settings
 from app.core.concurrency import user_request_lock
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import FloBaseException, RateLimitExceededError, StateExpiredError
+from app.core.turn_manager import TurnTicket, get_turn_manager
 from app.nlp.fast_intent import try_fast_intent
 from app.nlp.heuristics import try_heuristic_parse
 from app.nlp.validate import validate_parsed_for_write
@@ -124,81 +128,134 @@ async def dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await msg.reply_text(explain(GuardrailCode.EMPTY_MESSAGE))
         return
 
-    # Serialize per-user so state machine never interleaves under concurrent load
-    async with user_request_lock(tg_id):
-        try:
-            async with AsyncSessionLocal() as session:
-                users = UserService(session)
-                db_user, _ = await users.get_or_create(tg_id, user.username)
-                states = StateService(session)
-                state = await states.get_state(tg_id)
-                if states.last_expired:
-                    await msg.reply_text(StateExpiredError().message)
-                await states.append_turn(tg_id, "user", text)
+    # Merge / queue / supersede concurrent messages for this user
+    tm = get_turn_manager()
+    ticket = await tm.collect(tg_id, text)
+    if ticket is None:
+        # Absorbed into debounce buffer or queued behind an in-flight turn
+        return
 
-                if not db_user.onboarded or state.state.startswith("ONBOARD") or state.state == "NEW":
-                    await onboarding.handle(update, state.state if state.state != "IDLE" else "NEW")
-                    return
+    await _run_turn(update, tg_id, ticket)
+    # Drain queued follow-ups in order (after first completes)
+    while True:
+        nxt = await tm.finish(ticket)
+        if not nxt:
+            break
+        ticket = await tm.begin_queued(tg_id, nxt)
+        await _run_turn(update, tg_id, ticket)
 
-                name = state.state
-                # Mid-flow: if the user clearly starts a NEW log (has an amount +
-                # words) while stuck in edit UI, abandon and re-parse with NLP.
-                # Confirm/clarify keep their own NLP handlers for natural edits.
-                _EDIT_TRAP = {
-                    "EDIT_FIELD_SELECT",
-                    "EDIT_FIELD_VALUE",
-                    "EDIT_SPLIT_WHAT",
-                    "EDIT_SPLIT_VALUE",
-                }
-                # Escape edit trap when user starts a fresh multi-word log
-                # (digits present). Short yes/no/edit replies stay in the UI.
-                if (
-                    name in _EDIT_TRAP
-                    and not (is_affirm(text) or is_deny(text) or is_edit_intent(text))
-                    and any(ch.isdigit() for ch in text)
-                    and len(text.split()) >= 2
-                ):
-                    await states.go_idle(tg_id)
-                    await _idle_nlp(update, db_user.id, tg_id, text)
-                elif name == "CONFIRM_EXPENSE":
-                    await expense.handle_confirm(update, state)
-                elif name == "EDIT_FIELD_SELECT":
-                    await expense.handle_field_select(update, state)
-                elif name == "EDIT_FIELD_VALUE":
-                    await expense.handle_field_value(update, state)
-                elif name == "CONFIRM_SPLIT":
-                    await split.handle_confirm(update, state)
-                elif name == "EDIT_SPLIT_WHAT":
-                    await split.handle_edit_what(update, state)
-                elif name == "EDIT_SPLIT_VALUE":
-                    await split.handle_edit_value(update, state)
-                elif name == "CONFIRM_SETTLEMENT":
-                    await debt.handle_confirm(update, state)
-                elif name == "CLARIFYING":
-                    await expense.handle_clarification(update, state)
-                elif name.startswith("GOAL_"):
-                    await goals.handle_state(update, state)
-                elif name.startswith("SETTINGS_"):
-                    await settings_handler.handle(update, state)
-                elif name == "IDLE":
-                    lower = text.lower()
-                    if lower.startswith(("set income", "set budget", "set name")) or (
-                        settings_handler.extract_name_update(text) is not None
-                        and any(
-                            k in lower
-                            for k in ("call me", "my name", "set name", "i'm ", "i am ")
-                        )
-                    ):
-                        await settings_handler.handle(update, state)
-                    else:
-                        await _idle_nlp(update, db_user.id, tg_id, text)
-                else:
-                    await _idle_nlp(update, db_user.id, tg_id, text)
-        except FloBaseException as e:
-            await msg.reply_text(format_error(e))
-        except Exception as e:
-            log_event(logger, "dispatch.error", error=str(e), tg_id=tg_id)
-            await msg.reply_text("Something went wrong. Try again.")
+
+async def _run_turn(update: Update, tg_id: str, ticket: TurnTicket) -> None:
+    """Process one turn; skip replies if superseded mid-flight."""
+    text = ticket.text
+    with use_turn_text(text), bind_ticket(ticket):
+        async with user_request_lock(tg_id):
+            if not ticket.alive(get_turn_manager()):
+                return
+            try:
+                await _dispatch_state_machine(update, tg_id, text)
+            except FloBaseException as e:
+                if ticket.alive(get_turn_manager()):
+                    await reply_send(update, format_error(e))
+            except Exception as e:
+                log_event(logger, "dispatch.error", error=str(e), tg_id=tg_id)
+                if ticket.alive(get_turn_manager()):
+                    await reply_send(update, "Something went wrong. Try again.")
+            finally:
+                # Cancelled/superseded turns must not leave CONFIRM_* for the next ask
+                if not ticket.alive(get_turn_manager()):
+                    async with AsyncSessionLocal() as session:
+                        await StateService(session).go_idle(tg_id)
+
+
+async def _dispatch_state_machine(update: Update, tg_id: str, text: str) -> None:
+    """Core state routing for a single resolved user text."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    async with AsyncSessionLocal() as session:
+        users = UserService(session)
+        db_user, _ = await users.get_or_create(tg_id, user.username)
+        states = StateService(session)
+        state = await states.get_state(tg_id)
+        if states.last_expired:
+            await reply_send(update, StateExpiredError().message)
+        await states.append_turn(tg_id, "user", text)
+
+        if not db_user.onboarded or state.state.startswith("ONBOARD") or state.state == "NEW":
+            await onboarding.handle(update, state.state if state.state != "IDLE" else "NEW")
+            return
+
+        name = state.state
+        _EDIT_TRAP = {
+            "EDIT_FIELD_SELECT",
+            "EDIT_FIELD_VALUE",
+            "EDIT_SPLIT_WHAT",
+            "EDIT_SPLIT_VALUE",
+        }
+        _CONFIRM_TRAP = {
+            "CONFIRM_EXPENSE",
+            "CONFIRM_SPLIT",
+            "CONFIRM_SETTLEMENT",
+        }
+        _new_ask = (
+            not (is_affirm(text) or is_deny(text) or is_edit_intent(text))
+            and (
+                (any(ch.isdigit() for ch in text) and len(text.split()) >= 2)
+                or try_fast_intent(text) is not None
+                or try_heuristic_parse(text) is not None
+            )
+        )
+        _escape_edit = name in _EDIT_TRAP and _new_ask
+        _escape_confirm = name in _CONFIRM_TRAP and _new_ask
+        if _escape_edit or _escape_confirm:
+            await states.go_idle(tg_id)
+            await _idle_nlp(update, db_user.id, tg_id, text)
+        elif name == "CONFIRM_EXPENSE":
+            await expense.handle_confirm(update, state)
+        elif name == "EDIT_FIELD_SELECT":
+            await expense.handle_field_select(update, state)
+        elif name == "EDIT_FIELD_VALUE":
+            await expense.handle_field_value(update, state)
+        elif name == "CONFIRM_SPLIT":
+            await split.handle_confirm(update, state)
+        elif name == "EDIT_SPLIT_WHAT":
+            await split.handle_edit_what(update, state)
+        elif name == "EDIT_SPLIT_VALUE":
+            await split.handle_edit_value(update, state)
+        elif name == "CONFIRM_SETTLEMENT":
+            await debt.handle_confirm(update, state)
+        elif name == "CLARIFYING":
+            await expense.handle_clarification(update, state)
+        elif name.startswith("GOAL_"):
+            await goals.handle_state(update, state)
+        elif name.startswith("SETTINGS_"):
+            await settings_handler.handle(update, state)
+        elif name == "IDLE":
+            lower = text.lower()
+            if lower.startswith(("set income", "set budget", "set name")) or (
+                settings_handler.extract_name_update(text) is not None
+                and any(
+                    k in lower
+                    for k in (
+                        "call me",
+                        "my name",
+                        "set name",
+                        "save my name",
+                        "name as",
+                        "name to",
+                        "i'm ",
+                        "i am ",
+                    )
+                )
+            ):
+                await settings_handler.handle(update, state)
+            else:
+                await _idle_nlp(update, db_user.id, tg_id, text)
+        else:
+            await _idle_nlp(update, db_user.id, tg_id, text)
 
 
 async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None:
@@ -206,21 +263,65 @@ async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None
     Listen → understand → act → speak.
     Fast intents first (list/manage), then LLM; heuristic only if model is down.
     """
-    # Instant path for unambiguous asks — no OpenRouter round-trip
+    # Instant path — no OpenRouter (critical when free tier is 429'd)
     fast = try_fast_intent(text)
     if fast is not None:
         if fast.type == "query":
             await queries.handle(update, user_id, fast)
             return
+        if fast.type == "greeting":
+            async with AsyncSessionLocal() as session:
+                user = await UserService(session).users.get_by_id(user_id)
+            await fallback.handle_greeting(
+                update, user_id, user.name if user else None
+            )
+            return
+        if fast.needs_clarification:
+            async with AsyncSessionLocal() as session:
+                step = {
+                    "original_message": text,
+                    "clarification_question": fast.clarification_question,
+                }
+                await StateService(session).set_state(
+                    tg_id, "CLARIFYING", user_id=user_id, step_data=step
+                )
+            reply = fast.clarification_question or "Can you clarify?"
+            await reply_send(update, reply)
+            return
 
     await show_typing(update)
+
+    async def _progress_if_slow() -> None:
+        await asyncio.sleep(1.25)
+        ticket = current_ticket()
+        if ticket is None or ticket.alive(get_turn_manager()):
+            await reply_send(
+                update,
+                "⏳ Still gathering what I need for your message — one moment…",
+            )
+
+    progress_task = asyncio.create_task(_progress_if_slow())
     async with AsyncSessionLocal() as session:
         nlp = NLPService(session)
         try:
-            parsed = await nlp.parse(user_id, tg_id, text)
-        except FloBaseException as e:
-            await update.effective_message.reply_text(format_error(e))
-            return
+            try:
+                parsed = await nlp.parse(user_id, tg_id, text)
+            except FloBaseException:
+                # LLM down → last chance offline intents / heuristic
+                again = try_fast_intent(text) or try_heuristic_parse(text)
+                if again is not None and not (
+                    again.needs_clarification and again.confidence == 0.0
+                ):
+                    parsed = again
+                else:
+                    await reply_send(update, explain(GuardrailCode.NLP_UNAVAILABLE))
+                    return
+        finally:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
 
         # Model unavailable / bad JSON → fast intent again, then desc+amount heuristic
         if (
@@ -256,8 +357,7 @@ async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None
                 tg_id, "CLARIFYING", user_id=user_id, step_data=step
             )
             reply = parsed.clarification_question or "Can you clarify?"
-            await update.effective_message.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, reply)
             return
 
         if parsed.type == "expense":
@@ -283,8 +383,7 @@ async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None
                 due_day=day,
             )
             reply = f"Recurring saved ✅ {RecurringService(session).format_line(row)}"
-            await update.effective_message.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, reply)
         elif parsed.type == "greeting":
             user = await UserService(session).users.get_by_id(user_id)
             await fallback.handle_greeting(
@@ -294,16 +393,14 @@ async def _idle_nlp(update: Update, user_id: int, tg_id: str, text: str) -> None
             keyword = (parsed.description or "").strip()
             category = (parsed.category or "").strip()
             if not keyword or not category:
-                reply = "Tell me like: that medicine was groceries"
-                await update.effective_message.reply_text(reply)
-                await remember_bot_reply(tg_id, reply)
+                await reply_send(update, "Tell me like: that medicine was groceries")
                 return
             await CategoryService(session).record_correction(
                 user_id, keyword[:128], category
             )
-            reply = f"Got it — I'll remember '{keyword}' as {category}."
-            await update.effective_message.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(
+                update, f"Got it — I'll remember '{keyword}' as {category}."
+            )
         else:
             await fallback.handle_unknown(update, user_id)
 

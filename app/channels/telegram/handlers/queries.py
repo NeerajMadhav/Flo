@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from telegram import Update
 
 from app.channels.telegram.formatters import category_emoji
 from app.channels.telegram.handlers import debt as debt_handler
-from app.channels.telegram.memory import remember_bot_reply
+from app.channels.telegram.presence import show_typing
+from app.channels.telegram.replies import send as reply_send
 from app.core.database import AsyncSessionLocal
 from app.nlp.schemas import ParsedMessage
 from app.services.analytics_service import AnalyticsService
@@ -21,9 +24,16 @@ from app.utils.date_utils import month_end, month_start
 
 
 async def _reply(update: Update, text: str) -> None:
-    tg_id = str(update.effective_user.id)
-    await update.effective_message.reply_text(text)
-    await remember_bot_reply(tg_id, text)
+    await reply_send(update, text)
+
+
+async def _progress(update: Update, detail: str) -> None:
+    """Short ACK for multi-step ledger work."""
+    await show_typing(update)
+    await reply_send(
+        update,
+        f"⏳ Gathering the relevant info for your ask…\n{detail}",
+    )
 
 
 def _format_expense_line(e) -> str:
@@ -46,6 +56,14 @@ async def handle(update: Update, user_id: int, parsed: ParsedMessage) -> None:
     if intent in ("i_owe_who", "net_balance_contact"):
         await debt_handler.show_i_owe(update, user_id, params.get("contact"))
         return
+    if intent in ("category_breakdown_month", "category_breakdown_week"):
+        await _progress(update, "Breaking down spend by category")
+        async with AsyncSessionLocal() as session:
+            user = await UserService(session).users.get_by_id(user_id)
+            text = await AnalyticsService(session).handle_query(user, intent, params)
+        await _reply(update, text)
+        return
+
     if intent in ("list_categories", "help_categories", "categories"):
         async with AsyncSessionLocal() as session:
             cats = await CategoryService(session).list_display(user_id)
@@ -64,24 +82,60 @@ async def handle(update: Update, user_id: int, parsed: ParsedMessage) -> None:
         )
         return
 
-    if intent == "list_expenses":
+    if intent == "count_expenses":
         async with AsyncSessionLocal() as session:
             rows = await ExpenseService(session).repo.list_for_period(
                 user_id, month_start(), month_end()
             )
+        total_amt = sum((e.amount for e in rows), Decimal("0"))
+        n = len(rows)
+        await _reply(
+            update,
+            f"📊 This month: {n} expense{'s' if n != 1 else ''} · {format_inr(total_amt)}\n"
+            f"Say list expenses to see them, or fuel expenses to filter.",
+        )
+        return
+
+    if intent == "list_expenses":
+        cat_filter = (params.get("category") or "").strip().lower()
+        if cat_filter:
+            await _progress(update, f"Filtering {cat_filter} expenses")
+        async with AsyncSessionLocal() as session:
+            rows = await ExpenseService(session).repo.list_for_period(
+                user_id, month_start(), month_end()
+            )
+        if cat_filter:
+            rows = [
+                e
+                for e in rows
+                if (e.category and e.category.slug == cat_filter)
+                or (
+                    e.category
+                    and cat_filter in (e.category.display_name or "").lower()
+                )
+                or cat_filter in (e.description or "").lower()
+            ]
         if not rows:
-            await _reply(update, "No expenses this month yet. Log one like: petrol 250 ⛽")
+            label = f" for {cat_filter}" if cat_filter else ""
+            await _reply(
+                update,
+                f"No expenses{label} this month yet. Log one like: petrol 250 ⛽",
+            )
             return
-        # Newest first
         rows = sorted(rows, key=lambda e: (e.date, e.id), reverse=True)
         lines = [_format_expense_line(e) for e in rows[:15]]
         extra = f"\n…and {len(rows) - 15} more" if len(rows) > 15 else ""
+        title = (
+            f"📋 {cat_filter} this month ({len(rows)})"
+            if cat_filter
+            else f"📋 This month ({len(rows)})"
+        )
         await _reply(
             update,
-            f"📋 This month ({len(rows)}):\n"
+            f"{title}:\n"
             + "\n".join(lines)
             + extra
-            + "\n\nTo remove the newest: delete last expense",
+            + "\n\nTip: fuel expenses · list expenses · delete last expense",
         )
         return
 
@@ -139,7 +193,9 @@ async def handle(update: Update, user_id: int, parsed: ParsedMessage) -> None:
             "I can:\n"
             "• Log: petrol 250 ⛽\n"
             "• Split: fuel 578 split with Surya\n"
-            "• List: list expenses / what categories\n"
+            "• List: list expenses · how many expenses\n"
+            "• Filter: fuel expenses · food expenses\n"
+            "• Break down: by category\n"
             "• Fix: delete last expense\n"
             "• Ask: how much this month · who owes me",
         )

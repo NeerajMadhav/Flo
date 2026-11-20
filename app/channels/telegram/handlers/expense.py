@@ -11,8 +11,9 @@ from telegram import Update
 
 from app.channels.telegram.formatters import format_expense_preview
 from app.channels.telegram.keyboards import confirm_expense_keyboard, edit_field_keyboard
-from app.channels.telegram.memory import remember_bot_reply
 from app.channels.telegram.presence import show_typing
+from app.channels.telegram.replies import send as reply_send
+from app.channels.telegram.turn_text import user_text
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import ValidationError
 from app.nlp.heuristics import try_heuristic_parse
@@ -41,7 +42,6 @@ def _pending_from_parsed(parsed: ParsedMessage) -> dict[str, Any]:
 
 
 async def show_confirmation(update: Update, user_id: int, parsed: ParsedMessage, raw: str) -> None:
-    msg = update.effective_message
     tg_id = str(update.effective_user.id)
     validate_parsed_for_write(parsed)
     pending = _pending_from_parsed(parsed)
@@ -51,13 +51,11 @@ async def show_confirmation(update: Update, user_id: int, parsed: ParsedMessage,
             tg_id, "CONFIRM_EXPENSE", user_id=user_id, pending_data=pending
         )
     preview = format_expense_preview(parsed)
-    await msg.reply_text(preview, reply_markup=confirm_expense_keyboard())
-    await remember_bot_reply(tg_id, preview)
+    await reply_send(update, preview, reply_markup=confirm_expense_keyboard())
 
 
 async def handle_confirm(update: Update, state) -> None:
-    msg = update.effective_message
-    raw_text = msg.text or ""
+    raw_text = user_text(update)
     tg_id = str(update.effective_user.id)
 
     if is_affirm(raw_text):
@@ -66,9 +64,7 @@ async def handle_confirm(update: Update, state) -> None:
     if is_deny(raw_text):
         async with AsyncSessionLocal() as session:
             await StateService(session).go_idle(tg_id)
-        reply = "Cancelled. Nothing saved."
-        await msg.reply_text(reply)
-        await remember_bot_reply(tg_id, reply)
+        await reply_send(update, "Cancelled. Nothing saved.")
         return
     if is_edit_intent(raw_text):
         async with AsyncSessionLocal() as session:
@@ -78,14 +74,16 @@ async def handle_confirm(update: Update, state) -> None:
                 user_id=state.user_id,
                 pending_data=state.pending_data,
             )
-        reply = "What do you want to change?"
-        await msg.reply_text(reply, reply_markup=edit_field_keyboard())
-        await remember_bot_reply(tg_id, reply)
+        await reply_send(
+            update,
+            "What do you want to change?",
+            reply_markup=edit_field_keyboard(),
+        )
         return
 
     # Deterministic amount tweak: "amount 150" / "150" / "change to 150"
     pending = dict(state.pending_data or {})
-    raw_edit = (msg.text or "").strip()
+    raw_edit = raw_text
     amt_direct = None
     lower = raw_edit.lower()
     if lower.startswith("amount "):
@@ -101,35 +99,33 @@ async def handle_confirm(update: Update, state) -> None:
                 tg_id, "CONFIRM_EXPENSE", user_id=state.user_id, pending_data=pending
             )
         preview = format_expense_preview(pending)
-        await msg.reply_text(preview, reply_markup=confirm_expense_keyboard())
-        await remember_bot_reply(tg_id, preview)
+        await reply_send(update, preview, reply_markup=confirm_expense_keyboard())
         return
 
     # Free text while confirming: maybe a brand-new ask, or an edit of pending
     async with AsyncSessionLocal() as session:
         nlp = NLPService(session)
-        fresh = await nlp.parse(state.user_id, tg_id, msg.text or "")
+        fresh = await nlp.parse(state.user_id, tg_id, raw_text)
         if (
             fresh.type in ("expense", "split", "settlement", "goal", "query")
             and not fresh.needs_clarification
             and float(fresh.confidence or 0) >= 0.75
         ):
             await StateService(session).go_idle(tg_id)
-            await _route_resolved_parse(update, state.user_id, fresh, msg.text or "")
+            await _route_resolved_parse(update, state.user_id, fresh, raw_text)
             return
 
         parsed = await nlp.parse_edit(
-            state.user_id, state.pending_data or {}, msg.text or ""
+            state.user_id, state.pending_data or {}, raw_text
         )
         if parsed.needs_clarification:
             reply = parsed.clarification_question or explain(GuardrailCode.LOW_CONFIDENCE)
-            await msg.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, reply)
             return
         try:
             validate_parsed_for_write(parsed)
         except ValidationError as e:
-            await msg.reply_text(e.message)
+            await reply_send(update, e.message)
             return
         pending = _pending_from_parsed(parsed)
         pending["raw_message"] = (state.pending_data or {}).get("raw_message")
@@ -137,23 +133,22 @@ async def handle_confirm(update: Update, state) -> None:
             tg_id, "CONFIRM_EXPENSE", user_id=state.user_id, pending_data=pending
         )
     preview = format_expense_preview(parsed)
-    await msg.reply_text(preview, reply_markup=confirm_expense_keyboard())
-    await remember_bot_reply(tg_id, preview)
+    await reply_send(update, preview, reply_markup=confirm_expense_keyboard())
 
 
 async def handle_field_select(update: Update, state) -> None:
-    tg_id = str(update.effective_user.id)
-    reply = "Tap a field button, or type the change (e.g. 'amount 350')."
-    await update.effective_message.reply_text(reply, reply_markup=edit_field_keyboard())
-    await remember_bot_reply(tg_id, reply)
+    await reply_send(
+        update,
+        "Tap a field button, or type the change (e.g. 'amount 350').",
+        reply_markup=edit_field_keyboard(),
+    )
 
 
 async def handle_field_value(update: Update, state) -> None:
     """Apply the field chosen in EDIT_FIELD_SELECT (amount/category/…)."""
-    msg = update.effective_message
     tg_id = str(update.effective_user.id)
     field = (state.step_data or {}).get("edit_field") or "amount"
-    raw = (msg.text or "").strip()
+    raw = user_text(update)
     pending = dict(state.pending_data or {})
 
     # Fresh expense while editing → abandon edit and let caller re-route
@@ -175,31 +170,23 @@ async def handle_field_value(update: Update, state) -> None:
         if fresh is not None and not fresh.needs_clarification:
             await _route_resolved_parse(update, state.user_id, fresh, raw)
             return
-        reply = "Got it — starting fresh. Send the expense again?"
-        await msg.reply_text(reply)
-        await remember_bot_reply(tg_id, reply)
+        await reply_send(update, "Got it — starting fresh. Send the expense again?")
         return
 
     if field == "amount":
         amt = parse_indian_amount(raw)
         if amt is None or amt <= 0:
-            reply = "Send a valid amount, e.g. 350 or 1.5k"
-            await msg.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, "Send a valid amount, e.g. 350 or 1.5k")
             return
         pending["amount"] = str(amt)
     elif field == "category":
         if len(raw) < 2:
-            reply = "Send a category like fuel or food_outside ⛽"
-            await msg.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, "Send a category like fuel or food_outside ⛽")
             return
         pending["category"] = raw.lower().replace(" ", "_")[:64]
     elif field == "description":
         if len(raw) < 1:
-            reply = "Send a short description."
-            await msg.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, "Send a short description.")
             return
         pending["description"] = raw[:128]
     elif field == "date":
@@ -217,8 +204,7 @@ async def handle_field_value(update: Update, state) -> None:
             step_data={},
         )
     preview = format_expense_preview(pending)
-    await msg.reply_text(preview, reply_markup=confirm_expense_keyboard())
-    await remember_bot_reply(tg_id, preview)
+    await reply_send(update, preview, reply_markup=confirm_expense_keyboard())
 
 
 async def _route_resolved_parse(
@@ -247,17 +233,14 @@ async def _route_resolved_parse(
         tg_id = str(update.effective_user.id)
         async with AsyncSessionLocal() as session:
             await StateService(session).go_idle(tg_id)
-        reply = "Got it — starting fresh. What would you like to log?"
-        await update.effective_message.reply_text(reply)
-        await remember_bot_reply(tg_id, reply)
+        await reply_send(update, "Got it — starting fresh. What would you like to log?")
 
 
 async def handle_clarification(update: Update, state) -> None:
     """Resolve CLARIFYING via NLP (any phrasing); tiny heuristic only if models fail."""
-    msg = update.effective_message
     tg_id = str(update.effective_user.id)
     step = state.step_data or {}
-    answer = msg.text or ""
+    answer = user_text(update)
     original = step.get("original_message", "")
 
     await show_typing(update)
@@ -289,8 +272,7 @@ async def handle_clarification(update: Update, state) -> None:
                 step_data=step,
             )
             reply = parsed.clarification_question or "Can you clarify?"
-            await msg.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, reply)
             return
         await StateService(session).go_idle(tg_id)
 
@@ -312,7 +294,6 @@ def _pending_amount(pending: dict[str, Any]) -> Decimal:
 
 
 async def _save(update: Update, pending: dict[str, Any]) -> None:
-    msg = update.effective_message
     tg_id = str(update.effective_user.id)
     amount = _pending_amount(pending)
     async with AsyncSessionLocal() as session:
@@ -335,8 +316,7 @@ async def _save(update: Update, pending: dict[str, Any]) -> None:
     text = f"Saved ✅ {expense.description or 'Expense'} — {expense.amount}"
     if alert:
         text += f"\n\n{alert}"
-    await msg.reply_text(text)
-    await remember_bot_reply(tg_id, text)
+    await reply_send(update, text)
 
 
 async def save_from_callback(update: Update, pending: dict[str, Any]) -> None:

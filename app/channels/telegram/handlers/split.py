@@ -12,7 +12,8 @@ from telegram import Update
 
 from app.channels.telegram.formatters import format_split_preview
 from app.channels.telegram.keyboards import confirm_split_keyboard
-from app.channels.telegram.memory import remember_bot_reply
+from app.channels.telegram.replies import send as reply_send
+from app.channels.telegram.turn_text import user_text
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import ValidationError
 from app.nlp.schemas import ParsedMessage
@@ -44,7 +45,6 @@ def _pending_from_parsed(parsed: ParsedMessage) -> dict[str, Any]:
 async def show_confirmation(
     update: Update, user_id: int, parsed: ParsedMessage, raw: str
 ) -> None:
-    msg = update.effective_message
     tg_id = str(update.effective_user.id)
     validate_parsed_for_write(parsed)
     pending = _pending_from_parsed(parsed)
@@ -54,13 +54,11 @@ async def show_confirmation(
             tg_id, "CONFIRM_SPLIT", user_id=user_id, pending_data=pending
         )
     preview = format_split_preview(parsed)
-    await msg.reply_text(preview, reply_markup=confirm_split_keyboard())
-    await remember_bot_reply(tg_id, preview)
+    await reply_send(update, preview, reply_markup=confirm_split_keyboard())
 
 
 async def handle_confirm(update: Update, state) -> None:
-    msg = update.effective_message
-    raw = msg.text or ""
+    raw = user_text(update)
     tg_id = str(update.effective_user.id)
     if is_affirm(raw):
         await _save(update, state.pending_data or {})
@@ -68,9 +66,7 @@ async def handle_confirm(update: Update, state) -> None:
     if is_deny(raw):
         async with AsyncSessionLocal() as session:
             await StateService(session).go_idle(tg_id)
-        reply = "Cancelled."
-        await msg.reply_text(reply)
-        await remember_bot_reply(tg_id, reply)
+        await reply_send(update, "Cancelled.")
         return
     # Natural edit of pending split (any phrasing) via NLP
     async with AsyncSessionLocal() as session:
@@ -90,18 +86,16 @@ async def handle_confirm(update: Update, state) -> None:
                 tg_id, "CONFIRM_SPLIT", user_id=state.user_id, pending_data=pending
             )
             preview = format_split_preview(pending)
-            await msg.reply_text(preview, reply_markup=confirm_split_keyboard())
-            await remember_bot_reply(tg_id, preview)
+            await reply_send(update, preview, reply_markup=confirm_split_keyboard())
             return
-    reply = "Tap Save / Cancel, or say what to change (e.g. amount 800)."
-    await msg.reply_text(reply)
-    await remember_bot_reply(tg_id, reply)
+    await reply_send(
+        update, "Tap Save / Cancel, or say what to change (e.g. amount 800)."
+    )
 
 
 async def handle_edit_what(update: Update, state) -> None:
     """EDIT_SPLIT_WHAT — user picks which field to change."""
-    msg = update.effective_message
-    text = (msg.text or "").strip().lower()
+    text = user_text(update).lower()
     tg_id = str(update.effective_user.id)
     field = None
     if "amount" in text or "rupee" in text or "₹" in text:
@@ -113,7 +107,9 @@ async def handle_edit_what(update: Update, state) -> None:
     elif "categor" in text:
         field = "category"
     if not field:
-        await msg.reply_text("Say one of: amount, people, description, or category.")
+        await reply_send(
+            update, "Say one of: amount, people, description, or category."
+        )
         return
     async with AsyncSessionLocal() as session:
         await StateService(session).set_state(
@@ -123,25 +119,26 @@ async def handle_edit_what(update: Update, state) -> None:
             pending_data=state.pending_data,
             step_data={"edit_field": field},
         )
-    await msg.reply_text(f"Send the new {field.replace('split_with', 'people')}:")
+    await reply_send(
+        update, f"Send the new {field.replace('split_with', 'people')}:"
+    )
 
 
 async def handle_edit_value(update: Update, state) -> None:
     """EDIT_SPLIT_VALUE — apply field update and return to confirm."""
-    msg = update.effective_message
-    text = (msg.text or "").strip()
+    text = user_text(update)
     tg_id = str(update.effective_user.id)
     field = (state.step_data or {}).get("edit_field")
     pending = dict(state.pending_data or {})
     if field == "amount":
         amt = parse_indian_amount(text)
         if amt is None or amt <= 0:
-            await msg.reply_text("Send a valid amount, e.g. 600 or 1.5k")
+            await reply_send(update, "Send a valid amount, e.g. 600 or 1.5k")
             return
         pending["amount"] = str(amt)
     elif field == "description":
         if len(text) < 1:
-            await msg.reply_text("Send a short description.")
+            await reply_send(update, "Send a short description.")
             return
         pending["description"] = text
     elif field == "category":
@@ -153,12 +150,14 @@ async def handle_edit_value(update: Update, state) -> None:
             if n.strip()
         ]
         if not names:
-            await msg.reply_text("Send names, e.g. Rahul, Priya")
+            await reply_send(update, "Send names, e.g. Rahul, Priya")
             return
         pending["split_with"] = names
         pending["split_total_people"] = len(names) + 1
     else:
-        await msg.reply_text("Say amount, people, description, or category first.")
+        await reply_send(
+            update, "Say amount, people, description, or category first."
+        )
         async with AsyncSessionLocal() as session:
             await StateService(session).set_state(
                 tg_id,
@@ -176,20 +175,21 @@ async def handle_edit_value(update: Update, state) -> None:
             pending_data=pending,
             step_data={},
         )
-    await msg.reply_text(
-        format_split_preview(pending), reply_markup=confirm_split_keyboard()
+    await reply_send(
+        update,
+        format_split_preview(pending),
+        reply_markup=confirm_split_keyboard(),
     )
 
 
 async def _save(update: Update, pending: dict[str, Any]) -> None:
-    msg = update.effective_message
     tg_id = str(update.effective_user.id)
     if not pending.get("amount"):
         raise ValidationError("Split amount is missing.")
     async with AsyncSessionLocal() as session:
         user = await UserService(session).get_profile(tg_id)
         d = pending.get("date")
-        expense = await SplitService(session).create_split_expense(
+        await SplitService(session).create_split_expense(
             user.id,
             amount=Decimal(str(pending["amount"])),
             description=pending.get("description"),
@@ -205,9 +205,7 @@ async def _save(update: Update, pending: dict[str, Any]) -> None:
         await StateService(session).go_idle(tg_id)
     # Reuse preview shares (drop the Save prompt)
     summary = format_split_preview(pending).replace("\n\nSave this?", "").strip()
-    text = f"Split saved ✅\n{summary}"
-    await msg.reply_text(text)
-    await remember_bot_reply(tg_id, text)
+    await reply_send(update, f"Split saved ✅\n{summary}")
 
 
 async def save_from_callback(update: Update, pending: dict[str, Any]) -> None:

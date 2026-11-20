@@ -10,7 +10,8 @@ from telegram import Update
 
 from app.channels.telegram.formatters import format_settlement_preview
 from app.channels.telegram.keyboards import confirm_settlement_keyboard
-from app.channels.telegram.memory import remember_bot_reply
+from app.channels.telegram.replies import send as reply_send
+from app.channels.telegram.turn_text import user_text
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import ValidationError
 from app.nlp.schemas import ParsedMessage
@@ -23,7 +24,6 @@ from app.utils.text_utils import is_affirm, is_deny
 
 
 async def show_confirmation(update: Update, user_id: int, parsed: ParsedMessage) -> None:
-    msg = update.effective_message
     tg_id = str(update.effective_user.id)
     if not (parsed.settled_person or "").strip():
         raise ValidationError(explain(GuardrailCode.SETTLEMENT_NO_PERSON))
@@ -38,13 +38,11 @@ async def show_confirmation(update: Update, user_id: int, parsed: ParsedMessage)
             tg_id, "CONFIRM_SETTLEMENT", user_id=user_id, pending_data=pending
         )
     preview = format_settlement_preview(parsed)
-    await msg.reply_text(preview, reply_markup=confirm_settlement_keyboard())
-    await remember_bot_reply(tg_id, preview)
+    await reply_send(update, preview, reply_markup=confirm_settlement_keyboard())
 
 
 async def handle_confirm(update: Update, state) -> None:
-    msg = update.effective_message
-    raw = msg.text or ""
+    raw = user_text(update)
     tg_id = str(update.effective_user.id)
     if is_affirm(raw):
         await _save(update, state.pending_data or {})
@@ -52,17 +50,12 @@ async def handle_confirm(update: Update, state) -> None:
     if is_deny(raw):
         async with AsyncSessionLocal() as session:
             await StateService(session).go_idle(tg_id)
-        reply = "Cancelled."
-        await msg.reply_text(reply)
-        await remember_bot_reply(tg_id, reply)
+        await reply_send(update, "Cancelled.")
         return
-    reply = "Say yes / haan to confirm, or cancel."
-    await msg.reply_text(reply)
-    await remember_bot_reply(tg_id, reply)
+    await reply_send(update, "Say yes / haan to confirm, or cancel.")
 
 
 async def _save(update: Update, pending: dict[str, Any]) -> None:
-    msg = update.effective_message
     tg_id = str(update.effective_user.id)
     person = (pending.get("settled_person") or "").strip()
     if not person:
@@ -85,9 +78,7 @@ async def _save(update: Update, pending: dict[str, Any]) -> None:
         )
         await StateService(session).go_idle(tg_id)
         line = DebtService(session).format_balance_line(contact)
-    text = f"Settlement recorded ✅\n{line}"
-    await msg.reply_text(text)
-    await remember_bot_reply(tg_id, text)
+    await reply_send(update, f"Settlement recorded ✅\n{line}")
 
 
 async def save_from_callback(update: Update, pending: dict[str, Any]) -> None:
@@ -95,41 +86,29 @@ async def save_from_callback(update: Update, pending: dict[str, Any]) -> None:
 
 
 async def show_who_owes_me(update: Update, user_id: int) -> None:
-    tg_id = str(update.effective_user.id)
     async with AsyncSessionLocal() as session:
         contacts = await DebtService(session).who_owes_me(user_id)
         if not contacts:
-            reply = "Nobody owes you right now. ✨"
-            await update.effective_message.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, "Nobody owes you right now. ✨")
             return
         lines = [
             f"• {c.canonical_name}: {format_inr(c.net_balance)}" for c in contacts
         ]
-    reply = "Who owes you:\n" + "\n".join(lines)
-    await update.effective_message.reply_text(reply)
-    await remember_bot_reply(tg_id, reply)
+    await reply_send(update, "Who owes you:\n" + "\n".join(lines))
 
 
 async def show_i_owe(update: Update, user_id: int, name: str | None = None) -> None:
-    tg_id = str(update.effective_user.id)
     async with AsyncSessionLocal() as session:
         debts = DebtService(session)
         if name:
             c = await debts.contact_balance(user_id, name)
-            reply = debts.format_balance_line(c)
-            await update.effective_message.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, debts.format_balance_line(c))
             return
         contacts = await debts.i_owe_who(user_id)
         if not contacts:
-            reply = "You don't owe anyone right now. ✨"
-            await update.effective_message.reply_text(reply)
-            await remember_bot_reply(tg_id, reply)
+            await reply_send(update, "You don't owe anyone right now. ✨")
             return
         lines = [
             f"• {c.canonical_name}: {format_inr(abs(c.net_balance))}" for c in contacts
         ]
-    reply = "You owe:\n" + "\n".join(lines)
-    await update.effective_message.reply_text(reply)
-    await remember_bot_reply(tg_id, reply)
+    await reply_send(update, "You owe:\n" + "\n".join(lines))
